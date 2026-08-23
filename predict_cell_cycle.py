@@ -9,8 +9,6 @@ Dependencies: torch, torchvision, tifffile, albumentations, numpy, huggingface_h
 
 import json
 import os
-import sys
-from skimage.filters import threshold_otsu
 
 import albumentations as A
 import numpy as np
@@ -33,6 +31,8 @@ IN_CHANNELS = 5       # 1 DAPI channel × 5 z-slices
 LATENT_DIM = 256
 NB_CLASSES = 3
 CYCLE_PHASES = ["G1", "S", "G2/M"]
+EDGE = 10
+SCALE = 0.5
 
 # Nucleus crop size (maximum nucleus diameter in pixels) and model input resolution
 DATA_SET_SIZE = 280
@@ -151,17 +151,6 @@ def preprocess(array: np.ndarray, mean_std: dict) -> torch.Tensor:
     return tensor.unsqueeze(0)                                # (1, Z, H, W)
 
 
-def load_and_preprocess(tiff_path: str, mean_std: dict) -> torch.Tensor:
-    """Load a z-stack TIFF and return a model-ready tensor.
-
-    Thin wrapper around :func:`preprocess` for TIFF files.
-    Expected layout: (Z, H, W) uint16 — one DAPI channel, 5 z-slices.
-    """
-    return preprocess(tifffile.imread(tiff_path), mean_std)
-
-
-# ── Model loading ──────────────────────────────────────────────────────────────
-
 def _ensure_weights(models_dir: str) -> str:
     """Download pretrained weights from HuggingFace if not already present."""
     model_dir = os.path.join(models_dir, MODEL_SUBFOLDER)
@@ -172,7 +161,27 @@ def _ensure_weights(models_dir: str) -> str:
 
 
 def load_model(ccc_models_dir: str = "models", stardist_model: str = "2D_versatile_fluo") -> tuple[FucciClassifier, dict, StarDist2D]:
-    """Return a ready-to-use (eval-mode) FucciClassifier and its mean/std dict."""
+    """Load and return all models needed for inference.
+
+    Downloads the cell cycle classifier weights from HuggingFace if not already
+    present in `ccc_models_dir`.
+
+    Parameters
+    ----------
+    ccc_models_dir : str
+        Directory where the cell cycle classifier weights are (or will be) stored.
+    stardist_model : str
+        Name of the pretrained StarDist model used for nucleus segmentation.
+
+    Returns
+    -------
+    ccc_model : FucciClassifier
+        Cell cycle classifier in eval mode.
+    ccc_mean_std : dict
+        Per-channel normalisation statistics (keys "mean" and "std").
+    stardist_model : StarDist2D
+        StarDist segmentation model.
+    """
     ccc_model_dir = _ensure_weights(ccc_models_dir)
     ccc_model_path = os.path.join(ccc_model_dir, MODEL_FILENAME)
     ccc_mean_std_path = os.path.join(ccc_model_dir, MEAN_STD_FILENAME)
@@ -192,17 +201,17 @@ def load_model(ccc_models_dir: str = "models", stardist_model: str = "2D_versati
 
 # ── Inference ──────────────────────────────────────────────────────────────────
 
-def predict_array(
-    arrays: list[np.ndarray],
+def predict_nucleus(
+    array: np.ndarray,
     ccc_model: FucciClassifier,
     ccc_mean_std: dict,
-) -> list[str]:
-    """Predict the cell cycle phase for a list of nucleus crop arrays.
+) -> str:
+    """Predict the cell cycle phase for a single nucleus crop.
 
     Parameters
     ----------
-    arrays : list[np.ndarray]
-        Each array has shape (Z, H, W). uint16 or float32 in [0, 1].
+    array : np.ndarray
+        Shape (Z, H, W). uint16 or float32 in [0, 1].
     ccc_model : FucciClassifier
         Model returned by :func:`load_model`.
     ccc_mean_std : dict
@@ -210,42 +219,48 @@ def predict_array(
 
     Returns
     -------
-    list[str]
-        One of "G1", "S", or "G2/M" per input array.
+    str
+        One of "G1", "S", or "G2/M".
     """
-    batch = torch.cat([preprocess(a, ccc_mean_std) for a in arrays], dim=0)  # (N, Z, H, W)
+    pre_processed = preprocess(array, ccc_mean_std)
     with torch.no_grad():
-        logits = ccc_model(batch)                                              # (N, 3)
-    return [CYCLE_PHASES[i] for i in logits.argmax(dim=1).tolist()]
+        logits = ccc_model(pre_processed)  # (1, 3)
+    return CYCLE_PHASES[logits.argmax(dim=1).item()]
 
 
-def processing(
+def segment_nuclei(
     image: np.ndarray,
-    ccc_model: FucciClassifier,
-    ccc_mean_std: dict,
     stardist_model: StarDist2D,
+    edge: int = 10,
     scale: float = 0.5,
-) -> list[str]:
-    """Segment nuclei in a field-of-view image and predict their cell cycle phase.
+    H_CROP: int = 100,
+    W_CROP: int = 100,
+) -> tuple[list[np.ndarray], list[tuple[float, float]]]:
+    """Segment nuclei in a field-of-view image and return their crops and centres.
 
     Parameters
     ----------
     image : np.ndarray
-        (Z, H, W) raw DAPI image (uint16 or float32). StarDist segmentation
-        uses the max-projection across Z.
-    ccc_model : FucciClassifier
-        Model returned by :func:`load_model`.
-    ccc_mean_std : dict
-        Normalisation statistics returned by :func:`load_model`.
+        Shape (Z, H, W), uint16 or float32. StarDist segmentation runs on the
+        max-projection across Z.
     stardist_model : StarDist2D
         StarDist model returned by :func:`load_model`.
+    edge : int
+        Margin in pixels added around each detected bounding box. Nuclei whose
+        padded bounding box touches the image border are discarded.
     scale : float
         Rescaling factor passed to StarDist (default 0.5).
+    H_CROP : int
+        Minimum nucleus crop height (default 100).
+    W_CROP : int
+        Minimum nucleus crop width (default 100).
 
     Returns
     -------
-    list[str]
-        One of "G1", "S", or "G2/M" per detected nucleus.
+    crops : list[np.ndarray]
+        Per-nucleus arrays of shape (Z, H_crop, W_crop).
+    centers : list[tuple[float, float]]
+        (y, x) centroid coordinates for each returned nucleus.
     """
     # StarDist expects a 2D image — use the max-projection across z for segmentation
     image_2d = image.max(axis=0) if image.ndim == 3 else image
@@ -253,51 +268,82 @@ def processing(
 
     z, h, w = image.shape  # (Z, H, W)
     crops = []
+    centers = []
     for coord in details["coord"]:
-        y0, y1 = int(np.floor(coord[0].min())), int(np.ceil(coord[0].max()))
-        x0, x1 = int(np.floor(coord[1].min())), int(np.ceil(coord[1].max()))
+        y0, y1 = int(np.floor(coord[0].min())) - edge, int(np.ceil(coord[0].max())) + edge
+        x0, x1 = int(np.floor(coord[1].min())) - edge, int(np.ceil(coord[1].max())) + edge
         # skip nuclei touching the image border
-        if y0 <= 1 or y1 >= h - 1 or x0 <= 1 or x1 >= w - 1:
+        if y0 <= 0 or y1 >= h or x0 <= 0 or x1 >= w:
+            continue
+        if y1 - y0 < H_CROP or x1 - x0 < W_CROP:
             continue
         crops.append(image[:, y0:y1, x0:x1])  # (Z, H_crop, W_crop)
+        centers.append((coord[0].mean(), coord[1].mean()))
 
-    if not crops:
-        return []
-    return predict_array(crops, ccc_model, ccc_mean_std)
+    return crops, centers
 
 
-def predict(tiff_path: str, models_dir: str = "models") -> str:
-    """Predict the cell cycle phase for a single TIFF (convenience wrapper).
+def predict_image(image: np.ndarray, stardist_model, ccc_model, ccc_mean_std, edge, scale):
+    nuclei_crops, centers = segment_nuclei(
+        image=image,
+        stardist_model=stardist_model,
+        edge=edge,
+        scale=scale
+    )
 
-    Loads the model on every call — use :func:`load_model` + :func:`predict_array`
-    directly if you need to run inference on many images.
+    phases = [predict_nucleus(crop, ccc_model, ccc_mean_std) for crop in nuclei_crops]
+
+    return centers, phases
+
+def predict_dir(
+    directory: str,
+    stardist_model: StarDist2D,
+    ccc_model: FucciClassifier,
+    ccc_mean_std: dict,
+    edge: int = EDGE,
+    scale: float = SCALE,
+) -> dict[str, tuple[list[tuple[float, float]], list[str]]]:
+    """Predict cell cycle phases for all TIFF images in a directory.
 
     Parameters
     ----------
-    tiff_path : str
-        Path to a (Z, H, W) uint16 TIFF of the DAPI-stained nucleus.
-    models_dir : str
-        Directory where pretrained weights are (or will be) stored.
+    directory : str
+        Path to the directory containing TIFF images.
+    stardist_model : StarDist2D
+        StarDist model returned by :func:`load_model`.
+    ccc_model : FucciClassifier
+        Cell cycle classifier returned by :func:`load_model`.
+    ccc_mean_std : dict
+        Normalisation statistics returned by :func:`load_model`.
+    edge : int
+        Margin in pixels added around each nucleus bounding box.
+    scale : float
+        Rescaling factor passed to StarDist.
 
     Returns
     -------
-    str
-        One of "G1", "S", or "G2/M".
+    dict[str, tuple[list[tuple[float, float]], list[str]]]
+        Maps each filename to a (centers, phases) tuple.
     """
-    ccc_model, ccc_mean_std, stardist_model = load_model(models_dir)
-    return predict_array([tifffile.imread(tiff_path)], ccc_model, ccc_mean_std)[0]
+    results = {}
+    tiff_files = [f for f in os.listdir(directory) if f.lower().endswith((".tif", ".tiff"))]
 
+    for filename in tiff_files:
+        image = tifffile.imread(os.path.join(directory, filename))
+        if image.ndim == 2:
+            image = np.stack([image] * IN_CHANNELS, axis=0)
+        centers, phases = predict_image(image, stardist_model, ccc_model, ccc_mean_std, edge, scale)
+        results[filename] = (centers, phases)
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+    return results
+
 
 if __name__ == "__main__":
-    image = tifffile.imread("notebooks/Study_26/image_1702_Nucleus.ome.tiff")
-
-    # If the image is 2D (H, W), tile it to (Z, H, W) to match the model's expected input
-    if image.ndim == 2:
-        image = np.stack([image] * IN_CHANNELS, axis=0)
-
     ccc_model, ccc_mean_std, stardist_model = load_model()
 
-    phase = processing(image, ccc_model, ccc_mean_std, stardist_model)
-    print(f"Predicted cell cycle phase: {phase}")
+    results = predict_dir("notebooks/Study_26", stardist_model, ccc_model, ccc_mean_std)
+
+    for filename, (centers, phases) in results.items():
+        print(f"\n{filename}:")
+        for center, phase in zip(centers, phases):
+            print(f"  {phase} at {center}")
