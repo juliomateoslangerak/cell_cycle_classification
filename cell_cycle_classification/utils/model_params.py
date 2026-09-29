@@ -28,7 +28,7 @@ class FucciVAEModelParams(VAEModelParams):
         self.input_dimensions = Dimensions(height=128, width=128)
 
         self.c_indexes = [0]
-        self.z_indexes = [0, 1, 2, 3, 4]
+        self.z_indexes = [2]
 
         self.nb_classes = 3  # G1, S, G2
         self.out_channels = 2  # In addition to DAPI - FUCCI red and green

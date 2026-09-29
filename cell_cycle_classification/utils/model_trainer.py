@@ -147,7 +147,7 @@ class ModelTrainer:
             training_config=my_training_config,  # training config
             model_config=my_vae_config,  # model config
             project_name=f"vae-fucci{'-local' if is_local else ''}",  # specify your wandb project
-            entity_name="cbio-bis",  # specify your wandb entity
+            entity_name="julio-mateos-langerak-cnrs",  # specify your wandb entity
             run_name=params.format_now,  # name of the run
         )
         callbacks.append(wandb_cb)  # Add it to the callbacks list
